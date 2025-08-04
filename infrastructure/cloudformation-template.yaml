@@ -1,0 +1,344 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Tech Challenge B3 - Pipeline de dados completo para pregão da B3'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'tech-challenge-b3'
+    Description: 'Nome do projeto para tags e nomenclatura de recursos'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Ambiente de deployment'
+
+Resources:
+  # S3 Bucket para dados brutos
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-raw-data-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt TriggerLambdaFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'raw/'
+                  - Name: suffix
+                    Value: '.parquet'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket para dados refinados
+  RefinedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-refined-data-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role para Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueJobStartPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                Resource: !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-etl-job-${Environment}'
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role para Glue
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3DataAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${RawDataBucket}'
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${RefinedDataBucket}'
+                  - !Sub '${RefinedDataBucket}/*'
+        - PolicyName: GlueCatalogPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:CreateDatabase
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                  - glue:CreatePartition
+                  - glue:UpdatePartition
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function para trigger do Glue
+  TriggerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-trigger-glue-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          GLUE_JOB_NAME: !Sub '${ProjectName}-etl-job-${Environment}'
+          REFINED_BUCKET: !Ref RefinedDataBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from urllib.parse import unquote_plus
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          glue_client = boto3.client('glue')
+
+          def lambda_handler(event, context):
+              """
+              Lambda function triggered by S3 events to start Glue ETL job
+              """
+              try:
+                  # Parse S3 event
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = unquote_plus(record['s3']['object']['key'])
+                      
+                      logger.info(f"Processing file: s3://{bucket}/{key}")
+                      
+                      # Extract date from key for job parameters
+                      # Expected format: raw/year=YYYY/month=MM/day=DD/filename.parquet
+                      path_parts = key.split('/')
+                      year = month = day = None
+                      
+                      for part in path_parts:
+                          if part.startswith('year='):
+                              year = part.split('=')[1]
+                          elif part.startswith('month='):
+                              month = part.split('=')[1]
+                          elif part.startswith('day='):
+                              day = part.split('=')[1]
+                      
+                      if not all([year, month, day]):
+                          logger.error(f"Could not extract date from key: {key}")
+                          continue
+                      
+                      # Start Glue job
+                      job_name = os.environ['GLUE_JOB_NAME']
+                      refined_bucket = os.environ['REFINED_BUCKET']
+                      
+                      response = glue_client.start_job_run(
+                          JobName=job_name,
+                          Arguments={
+                              '--input_path': f's3://{bucket}/{key}',
+                              '--output_path': f's3://{refined_bucket}/refined/',
+                              '--year': year,
+                              '--month': month,
+                              '--day': day
+                          }
+                      )
+                      
+                      job_run_id = response['JobRunId']
+                      logger.info(f"Started Glue job {job_name} with run ID: {job_run_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Glue job started successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error starting Glue job: {str(e)}")
+                  raise e
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Permission for S3 to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${RawDataBucket}'
+
+  # Glue Database
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_database_${Environment}'
+        Description: 'Database for B3 stock market data'
+
+  # Glue ETL Job (será criado manualmente no modo visual)
+  # Este é apenas um placeholder para referência
+  GlueETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-etl-job-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${RawDataBucket}/scripts/etl_job.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--TempDir': !Sub 's3://${RawDataBucket}/temp/'
+        '--job-bookmark-option': 'job-bookmark-enable'
+        '--enable-metrics': ''
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--database_name': !Ref GlueDatabase
+      MaxRetries: 1
+      Timeout: 60
+      GlueVersion: '3.0'
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # CloudWatch Log Group para Lambda
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TriggerLambdaFunction}'
+      RetentionInDays: 14
+
+  # CloudWatch Log Group para Glue
+  GlueLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws-glue/jobs/${ProjectName}-etl-job-${Environment}'
+      RetentionInDays: 14
+
+Outputs:
+  RawDataBucketName:
+    Description: 'Nome do bucket S3 para dados brutos'
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${ProjectName}-raw-bucket-${Environment}'
+
+  RefinedDataBucketName:
+    Description: 'Nome do bucket S3 para dados refinados'
+    Value: !Ref RefinedDataBucket
+    Export:
+      Name: !Sub '${ProjectName}-refined-bucket-${Environment}'
+
+  LambdaFunctionName:
+    Description: 'Nome da função Lambda'
+    Value: !Ref TriggerLambdaFunction
+    Export:
+      Name: !Sub '${ProjectName}-lambda-${Environment}'
+
+  GlueJobName:
+    Description: 'Nome do job Glue ETL'
+    Value: !Ref GlueETLJob
+    Export:
+      Name: !Sub '${ProjectName}-glue-job-${Environment}'
+
+  GlueDatabaseName:
+    Description: 'Nome do database Glue'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${ProjectName}-glue-database-${Environment}'
+
+  GlueServiceRoleArn:
+    Description: 'ARN do role de serviço do Glue'
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-glue-role-${Environment}'
+

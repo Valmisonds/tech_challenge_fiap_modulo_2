@@ -457,3 +457,5 @@ SHOW PARTITIONS cotacoes_b3_refined;
 
 Este projeto foi desenvolvido para fins educacionais como parte do Tech Challenge Fase 2.
 
+**⚠️ Importante**: Configure adequadamente as credenciais AWS e siga as melhores práticas de segurança antes do deploy em produção.
+

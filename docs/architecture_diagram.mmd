@@ -1,0 +1,86 @@
+graph TB
+    %% Tech Challenge B3 - Arquitetura do Pipeline de Dados
+    
+    subgraph "Data Sources"
+        B3[🏢 Site B3<br/>Dados do Pregão]
+    end
+    
+    subgraph "Data Extraction"
+        SCRAPER[🐍 Python Scraper<br/>- Web scraping<br/>- Formato Parquet<br/>- Particionamento diário]
+    end
+    
+    subgraph "AWS Cloud"
+        subgraph "Storage Layer"
+            S3_RAW[(📦 S3 Raw Bucket<br/>raw/year=YYYY/month=MM/day=DD/<br/>cotacoes_YYYYMMDD.parquet)]
+            S3_REFINED[(📦 S3 Refined Bucket<br/>refined/year=YYYY/month=MM/<br/>day=DD/symbol=ACAO/)]
+        end
+        
+        subgraph "Processing Layer"
+            LAMBDA[⚡ Lambda Function<br/>- Trigger automático<br/>- Inicia job Glue<br/>- Error handling]
+            
+            GLUE[🔧 AWS Glue ETL<br/>- Modo Visual<br/>- Agrupamento numérico<br/>- Renomeação colunas<br/>- Cálculos de data<br/>- Particionamento]
+        end
+        
+        subgraph "Catalog Layer"
+            CATALOG[(📚 Glue Data Catalog<br/>- Metadados automáticos<br/>- Schema inference<br/>- Partições)]
+        end
+        
+        subgraph "Query Layer"
+            ATHENA[🔍 Amazon Athena<br/>- Consultas SQL<br/>- Performance otimizada<br/>- Análises ad-hoc]
+            
+            NOTEBOOK[📊 Athena Notebook<br/>- Visualizações<br/>- Python analytics<br/>- Dashboards]
+        end
+        
+        subgraph "Monitoring"
+            CLOUDWATCH[📈 CloudWatch<br/>- Logs centralizados<br/>- Métricas<br/>- Alertas]
+        end
+        
+        subgraph "Security"
+            IAM[🔐 IAM Roles<br/>- Least privilege<br/>- Service roles<br/>- Cross-service access]
+        end
+    end
+    
+    subgraph "Users & Applications"
+        ANALYST[👨‍💼 Analista de Dados]
+        BI[📊 Ferramentas BI<br/>QuickSight, Tableau]
+        API[🔌 APIs & Applications]
+    end
+    
+    %% Data Flow
+    B3 --> SCRAPER
+    SCRAPER --> S3_RAW
+    S3_RAW -.->|S3 Event| LAMBDA
+    LAMBDA --> GLUE
+    GLUE --> S3_REFINED
+    GLUE --> CATALOG
+    S3_REFINED --> ATHENA
+    CATALOG --> ATHENA
+    ATHENA --> NOTEBOOK
+    ATHENA --> ANALYST
+    ATHENA --> BI
+    ATHENA --> API
+    
+    %% Monitoring connections
+    LAMBDA -.-> CLOUDWATCH
+    GLUE -.-> CLOUDWATCH
+    ATHENA -.-> CLOUDWATCH
+    
+    %% Security connections
+    LAMBDA -.-> IAM
+    GLUE -.-> IAM
+    ATHENA -.-> IAM
+    
+    %% Styling
+    classDef aws fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:#fff
+    classDef storage fill:#3F8FBF,stroke:#232F3E,stroke-width:2px,color:#fff
+    classDef processing fill:#FF6B6B,stroke:#232F3E,stroke-width:2px,color:#fff
+    classDef query fill:#4ECDC4,stroke:#232F3E,stroke-width:2px,color:#fff
+    classDef external fill:#95E1D3,stroke:#232F3E,stroke-width:2px,color:#000
+    classDef security fill:#F38BA8,stroke:#232F3E,stroke-width:2px,color:#fff
+    
+    class S3_RAW,S3_REFINED,CATALOG storage
+    class LAMBDA,GLUE processing
+    class ATHENA,NOTEBOOK query
+    class B3,SCRAPER,ANALYST,BI,API external
+    class IAM,CLOUDWATCH security
+
